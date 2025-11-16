@@ -1,119 +1,180 @@
 #!/usr/bin/env python3
+"""FairMoney: RAW -> REPORTING ETL (refactored, modular, human-style)
+
+Run:
+    python etl_raw_to_reporting.py 2025-11-15
+
+Notes:
+- Requires pyspark and psycopg2 in the runtime environment.
+- Expects RAW JDBC and REPORTING DB connection info via environment variables.
+- This script writes staging tables to the reporting DB and executes server-side upserts.
 """
-FairMoney ETL Pipeline: RAW to REPORTING Layer
-Simple functional approach for transforming RAW data to dimensional model
-"""
-#!/usr/bin/env python3
+
+import os
 import sys
 import logging
-import traceback
-from datetime import datetime, timedelta, date
-import os
-import json
+from datetime import datetime, date, timedelta
+from typing import List, Tuple
+
 import psycopg2
 from psycopg2.extras import execute_values
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
-    col, lit, current_timestamp, when, coalesce,
-    date_format, to_date, year, month, dayofmonth, dayofweek,
-    quarter, concat, floor, datediff, last_day
+    col, lit, current_timestamp, coalesce, concat, date_format, to_date,
+    year, month, quarter, dayofmonth, dayofweek, when, floor, datediff, last_day
 )
 from pyspark.sql.types import IntegerType, DateType
 from pyspark.sql.window import Window
 from pyspark.sql.functions import row_number
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-def get_db_configs():
+
+LOG = logging.getLogger("etl")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def get_config():
+    """Load DB connection strings and small settings from environment."""
     return {
-        'raw': {
-            'url': os.getenv('RAW_DB_URL', 'jdbc:postgresql://localhost:5432/fairmoney_raw'),
-            'user': os.getenv('RAW_DB_USER', 'postgres'),
-            'password': os.getenv('RAW_DB_PASSWORD', 'password'),
-            'driver': 'org.postgresql.Driver'
-        },
-        'reporting': {
-            'host': os.getenv('REPORTING_DB_HOST', 'localhost'),
-            'port': int(os.getenv('REPORTING_DB_PORT', '5432')),
-            'dbname': os.getenv('REPORTING_DB_NAME', 'fairmoney_reporting'),
-            'user': os.getenv('REPORTING_DB_USER', 'postgres'),
-            'password': os.getenv('REPORTING_DB_PASSWORD', 'password'),
-            'jdbc_url': os.getenv('REPORTING_DB_JDBC', 'jdbc:postgresql://localhost:5432/fairmoney_reporting'),
-            'jdbc_driver': 'org.postgresql.Driver'
-        }
+        "raw_jdbc_url": os.getenv("RAW_DB_URL", "jdbc:postgresql://localhost:5432/fairmoney_raw"),
+        "raw_user": os.getenv("RAW_DB_USER", "postgres"),
+        "raw_password": os.getenv("RAW_DB_PASSWORD", "password"),
+        "raw_driver": os.getenv("RAW_DB_DRIVER", "org.postgresql.Driver"),
+        "reporting_host": os.getenv("REPORTING_DB_HOST", "localhost"),
+        "reporting_port": int(os.getenv("REPORTING_DB_PORT", "5432")),
+        "reporting_db": os.getenv("REPORTING_DB_NAME", "fairmoney_reporting"),
+        "reporting_user": os.getenv("REPORTING_DB_USER", "postgres"),
+        "reporting_password": os.getenv("REPORTING_DB_PASSWORD", "password"),
+        "reporting_jdbc": os.getenv("REPORTING_DB_JDBC", "jdbc:postgresql://localhost:5432/fairmoney_reporting"),
+        "reporting_driver": os.getenv("REPORTING_DB_JDBC_DRIVER", "org.postgresql.Driver"),
     }
+
+
 def pg_connect(cfg):
     return psycopg2.connect(
-        host=cfg['host'],
-        port=cfg['port'],
-        dbname=cfg['dbname'],
-        user=cfg['user'],
-        password=cfg['password']
+        host=cfg["reporting_host"],
+        port=cfg["reporting_port"],
+        dbname=cfg["reporting_db"],
+        user=cfg["reporting_user"],
+        password=cfg["reporting_password"],
     )
-def execute_sql(conn, sql, params=None):
+
+
+def write_df_to_reporting_jdbc(df: DataFrame, jdbc_url: str, user: str, password: str, driver: str, table: str, mode: str = "overwrite"):
+    """Write a Spark DataFrame to reporting via JDBC. Use mode=append/overwrite as needed."""
+    df.write.format("jdbc") \
+        .option("url", jdbc_url) \
+        .option("dbtable", table) \
+        .option("user", user) \
+        .option("password", password) \
+        .option("driver", driver) \
+        .mode(mode) \
+        .save()
+
+
+def upsert_from_staging(
+    conn,
+    staging_table: str,
+    target_table: str,
+    key_cols: List[str],
+    update_cols: List[str]
+):
+    """Upsert from staging table into target table using INSERT ... ON CONFLICT DO UPDATE.
+    This runs in the reporting database and is atomic per statement.
+    """
+    all_cols = key_cols + update_cols
+    col_list_sql = ", ".join(all_cols)
+    conflict_target = "(" + ", ".join(key_cols) + ")"
+    set_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in update_cols])
+
+    sql = f"""
+    INSERT INTO reporting.{target_table} ({col_list_sql})
+    SELECT {col_list_sql} FROM reporting.{staging_table}
+    ON CONFLICT {conflict_target} DO UPDATE
+    SET {set_sql};
+    """
+
     with conn.cursor() as cur:
-        cur.execute(sql, params)
+        cur.execute(sql)
     conn.commit()
-def upsert_dataframe_to_table(conn, df_rows, table_name, columns, conflict_target, update_columns):
-    if not df_rows:
-        return
-    cols_sql = ','.join(columns)
-    update_sql = ','.join([f"{c}=EXCLUDED.{c}" for c in update_columns])
-    sql = f"INSERT INTO reporting.{table_name} ({cols_sql}) VALUES %s ON CONFLICT {conflict_target} DO UPDATE SET {update_sql};"
+
+
+def clear_staging(conn, staging_table: str):
     with conn.cursor() as cur:
-        execute_values(cur, sql, df_rows, template=None, page_size=1000)
+        cur.execute(f"TRUNCATE TABLE reporting.{staging_table};")
     conn.commit()
-def run_etl_pipeline(run_date=None):
-    if not run_date:
-        run_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    batch_id = f"raw_to_reporting_idempotent_{run_date}_{datetime.now().strftime('%H%M%S')}"
-    logger.info(f"Starting idempotent RAW->REPORTING ETL for {run_date} batch_id={batch_id}")
-    db_cfgs = get_db_configs()
-    reporting_cfg = db_cfgs['reporting']
-    spark = SparkSession.builder.appName(f"FairMoney-RAW-to-REPORTING-idempotent-{batch_id}").config("spark.serializer", "org.apache.spark.serializer.KryoSerializer").getOrCreate()
+
+
+def build_spark_session(app_name: str):
+    spark = SparkSession.builder \
+        .appName(app_name) \
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+        .getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
-    def read_raw(table):
-        return spark.read.format("jdbc").option("url", db_cfgs['raw']['url']).option("dbtable", f"raw.{table}").option("user", db_cfgs['raw']['user']).option("password", db_cfgs['raw']['password']).option("driver", db_cfgs['raw']['driver']).load()
-    try:
-        start_date = date(2020, 1, 1)
-        end_date = date(2030, 12, 31)
-        days = []
-        d = start_date
-        while d <= end_date:
-            days.append((d,))
-            d = d + timedelta(days=1)
-        date_df = spark.createDataFrame(days, ["date_value"])
-        dim_date = date_df.select(
-            date_format(col("date_value"), "yyyyMMdd").cast(IntegerType()).alias("date_key"),
-            col("date_value").alias("full_date"),
-            year(col("date_value")).alias("year"),
-            quarter(col("date_value")).alias("quarter"),
-            month(col("date_value")).alias("month"),
-            dayofmonth(col("date_value")).alias("day"),
-            date_format(col("date_value"), "EEEE").alias("day_name"),
-            date_format(col("date_value"), "MMMM").alias("month_name"),
-            concat(lit("Q"), quarter(col("date_value"))).alias("quarter_name"),
-            date_format(col("date_value"), "yyyyMM").alias("year_month"),
-            concat(year(col("date_value")), lit("-Q"), quarter(col("date_value"))).alias("year_quarter"),
-            when(dayofweek(col("date_value")).isin([1,7]), True).otherwise(False).alias("is_weekend"),
-            (col("date_value") == last_day(col("date_value"))).alias("is_month_end"),
-            ((month(col("date_value")) % 3 == 0) & (col("date_value") == last_day(col("date_value")))).alias("is_quarter_end"),
-            ((col("date_value") == last_day(col("date_value"))) & (month(col("date_value")) == 12)).alias("is_year_end"),
-            year(col("date_value")).alias("fiscal_year"),
-            quarter(col("date_value")).alias("fiscal_quarter"),
-            current_timestamp().alias("created_at")
-        )
-        dim_date.write.format("jdbc").option("url", reporting_cfg['jdbc_url']).option("dbtable", "reporting.dim_date").option("user", reporting_cfg['user']).option("password", reporting_cfg['password']).option("driver", reporting_cfg['jdbc_driver']).mode("overwrite").save()
-        customers_df = read_raw("customers").cache()
-        countries_df = read_raw("countries").cache()
-        products_df = read_raw("loan_products").cache()
-        loans_df = read_raw("loans").cache()
-        payments_df = read_raw("payments").cache()
-        applications_df = read_raw("loan_applications").cache()
-        emi_df = read_raw("emi_schedule").cache()
-        collections_df = read_raw("collections").cache()
-        customer_kyc_df = read_raw("customer_kyc").cache()
-        kyc_latest = customer_kyc_df.withColumn("rn", row_number().over(Window.partitionBy("customer_id").orderBy(col("verified_at").desc_nulls_last()))).filter(col("rn") == 1).select("customer_id", "verification_status", "verified_at")
-        dim_customer_df = customers_df.alias("c").join(countries_df.alias("co"), col("c.country_id") == col("co.country_id"), "left").join(kyc_latest.alias("k"), col("c.customer_id") == col("k.customer_id"), "left").select(
+    return spark
+
+
+def load_raw_tables(spark: SparkSession, cfg: dict) -> dict:
+    """Read raw.* tables into a dictionary of DataFrames."""
+    def read(table):
+        return spark.read.format("jdbc") \
+            .option("url", cfg["raw_jdbc_url"]) \
+            .option("dbtable", f"raw.{table}") \
+            .option("user", cfg["raw_user"]) \
+            .option("password", cfg["raw_password"]) \
+            .option("driver", cfg["raw_driver"]) \
+            .load()
+
+    LOG.info("Loading raw tables")
+    tables = {}
+    for name in ["countries", "customers", "customer_kyc", "loan_products", "loan_applications", "loans", "emi_schedule", "payments", "collections"]:
+        tables[name] = read(name).cache()
+        LOG.info("Loaded raw.%s rows=%s", name, tables[name].count())
+    return tables
+
+
+def build_dim_date(spark: SparkSession, run_date: str) -> DataFrame:
+    start = date(2020, 1, 1)
+    end = date(2030, 12, 31)
+    days = []
+    d = start
+    while d <= end:
+        days.append((d,))
+        d += timedelta(days=1)
+    df = spark.createDataFrame(days, ["date_value"])
+    dd = df.select(
+        date_format(col("date_value"), "yyyyMMdd").cast(IntegerType()).alias("date_key"),
+        col("date_value").alias("full_date"),
+        year(col("date_value")).alias("year"),
+        quarter(col("date_value")).alias("quarter"),
+        month(col("date_value")).alias("month"),
+        dayofmonth(col("date_value")).alias("day"),
+        date_format(col("date_value"), "EEEE").alias("day_name"),
+        date_format(col("date_value"), "MMMM").alias("month_name"),
+        concat(lit("Q"), quarter(col("date_value"))).alias("quarter_name"),
+        date_format(col("date_value"), "yyyyMM").alias("year_month"),
+        concat(year(col("date_value")), lit("-Q"), quarter(col("date_value"))).alias("year_quarter"),
+        when(dayofweek(col("date_value")).isin([1, 7]), True).otherwise(False).alias("is_weekend"),
+        (col("date_value") == last_day(col("date_value"))).alias("is_month_end"),
+        ((month(col("date_value")) % 3 == 0) & (col("date_value") == last_day(col("date_value")))).alias("is_quarter_end"),
+        ((col("date_value") == last_day(col("date_value"))) & (month(col("date_value")) == 12)).alias("is_year_end"),
+        year(col("date_value")).alias("fiscal_year"),
+        quarter(col("date_value")).alias("fiscal_quarter"),
+        current_timestamp().alias("created_at")
+    )
+    return dd
+
+
+def build_dim_customer(raw_customers: DataFrame, raw_countries: DataFrame, raw_kyc: DataFrame, run_date: str) -> DataFrame:
+    latest_kyc = (
+        raw_kyc.withColumn("rn", row_number().over(Window.partitionBy("customer_id").orderBy(col("verified_at").desc_nulls_last())))
+        .filter(col("rn") == 1)
+        .select("customer_id", "verification_status", "verified_at")
+    )
+
+    df = (
+        raw_customers.alias("c")
+        .join(raw_countries.alias("co"), col("c.country_id") == col("co.country_id"), "left")
+        .join(latest_kyc.alias("k"), col("c.customer_id") == col("k.customer_id"), "left")
+        .select(
             col("c.customer_id").alias("customer_id"),
             coalesce(col("co.country_code"), lit("UNKNOWN")).alias("country_code"),
             coalesce(col("co.country_name"), lit("UNKNOWN")).alias("country_name"),
@@ -134,15 +195,27 @@ def run_etl_pipeline(run_date=None):
             lit(None).cast(DateType()).alias("end_date"),
             lit(True).alias("is_current"),
             current_timestamp().alias("created_at"),
-            current_timestamp().alias("updated_at")
+            current_timestamp().alias("updated_at"),
         )
-        dim_customer_df = dim_customer_df.withColumn("age_group", when(col("age_years") < 18, "0-17").when(col("age_years").between(18,24), "18-24").when(col("age_years").between(25,34), "25-34").when(col("age_years").between(35,44), "35-44").otherwise("45+")).drop("age_years")
-        dim_customer_rows = [tuple(r) for r in dim_customer_df.collect()]
-        customer_cols = ["customer_id", "country_code", "country_name", "currency_code", "customer_name", "phone_number", "email", "date_of_birth", "age_group", "customer_status", "customer_segment", "registration_year", "registration_month", "registration_cohort", "kyc_status", "kyc_verified_date", "effective_date", "end_date", "is_current", "created_at", "updated_at"]
-        conn = pg_connect(reporting_cfg)
-        upsert_dataframe_to_table(conn, dim_customer_rows, "dim_customer", customer_cols, "(customer_id)", [c for c in customer_cols if c not in ("customer_id","created_at")])
-        conn.close()
-        dim_product_df = products_df.alias("p").join(countries_df.alias("c"), col("p.country_id") == col("c.country_id"), "left").select(
+    )
+
+    df = (df.withColumn("age_group", 
+            when(col("age_years") < 18, "0-17")
+            .when(col("age_years").between(18, 24), "18-24")
+            .when(col("age_years").between(25, 34), "25-34")
+            .when(col("age_years").between(35, 44), "35-44")
+            .otherwise("45+")
+        ).drop("age_years")
+    )
+
+    return df
+
+
+def build_dim_product(raw_products: DataFrame, raw_countries: DataFrame, run_date: str) -> DataFrame:
+    df = (
+        raw_products.alias("p")
+        .join(raw_countries.alias("c"), col("p.country_id") == col("c.country_id"), "left")
+        .select(
             col("p.product_id").alias("product_id"),
             coalesce(col("c.country_code"), lit("UNKNOWN")).alias("country_code"),
             coalesce(col("c.country_name"), lit("UNKNOWN")).alias("country_name"),
@@ -162,15 +235,22 @@ def run_etl_pipeline(run_date=None):
             coalesce(col("p.is_active"), lit(True)).alias("is_active"),
             to_date(lit(run_date)).alias("effective_date"),
             lit(None).cast(DateType()).alias("updated_at"),
-            current_timestamp().alias("created_at")
+            current_timestamp().alias("created_at"),
         )
-        dim_product_rows = [tuple(r) for r in dim_product_df.collect()]
-        product_cols = ["product_id", "country_code", "country_name", "product_name", "product_code", "product_category", "min_amount", "max_amount", "amount_tier", "min_tenure_days", "max_tenure_days", "tenure_tier", "interest_rate", "interest_tier", "processing_fee_rate", "risk_tier", "is_active", "effective_date", "updated_at", "created_at"]
-        conn = pg_connect(reporting_cfg)
-        upsert_dataframe_to_table(conn, dim_product_rows, "dim_product", product_cols, "(product_id)", [c for c in product_cols if c != "product_id"])
-        conn.close()
-        loans_win = Window.partitionBy("customer_id").orderBy(col("disbursement_date").asc_nulls_last())
-        dim_loan_df = loans_df.withColumn("vintage_year", year(col("disbursement_date"))).withColumn("vintage_month", month(col("disbursement_date"))).withColumn("tenure_months", (col("tenure_days") / 30).cast("integer")).withColumn("customer_loan_sequence", row_number().over(loans_win)).withColumn("is_first_loan", (col("customer_loan_sequence") == 1).cast("boolean")).select(
+    )
+    return df
+
+
+def build_dim_loan(raw_loans: DataFrame) -> DataFrame:
+    win = Window.partitionBy("customer_id").orderBy(col("disbursement_date").asc_nulls_last())
+    df = (
+        raw_loans
+        .withColumn("vintage_year", year(col("disbursement_date")))
+        .withColumn("vintage_month", month(col("disbursement_date")))
+        .withColumn("tenure_months", (col("tenure_days") / 30).cast("integer"))
+        .withColumn("customer_loan_sequence", row_number().over(win))
+        .withColumn("is_first_loan", (col("customer_loan_sequence") == 1).cast("boolean"))
+        .select(
             col("loan_id").alias("loan_id"),
             col("loan_number").alias("loan_number"),
             coalesce(col("loan_status"), lit("UNKNOWN")).alias("loan_status"),
@@ -188,32 +268,31 @@ def run_etl_pipeline(run_date=None):
             current_timestamp().alias("created_at"),
             col("principal_amount"),
             col("interest_amount"),
-            col("total_amount")
+            col("total_amount"),
         )
-        dim_loan_rows = [tuple(r) for r in dim_loan_df.collect()]
-        loan_cols = ["loan_id", "loan_number", "loan_status", "loan_type", "vintage_year", "vintage_month", "vintage_cohort", "maturity_year", "maturity_month", "tenure_days", "tenure_months", "tenure_tier", "is_first_loan", "customer_loan_sequence", "created_at", "principal_amount", "interest_amount", "total_amount"]
-        conn = pg_connect(reporting_cfg)
-        upsert_dataframe_to_table(conn, dim_loan_rows, "dim_loan", loan_cols, "(loan_id)", [c for c in loan_cols if c != "loan_id"])
-        conn.close()
-        pm = payments_df.select("payment_method").distinct().na.fill("UNKNOWN")
-        dim_pm_df = pm.select(
-            col("payment_method"),
-            when(col("payment_method").like("%MOBILE%"), lit("Mobile")).when(col("payment_method").like("%BANK%"), lit("Bank")).otherwise(lit("Other")).alias("payment_channel"),
-            when(col("payment_method").like("%MOBILE%"), lit("Digital")).when(col("payment_method").like("%BANK%"), lit("Digital")).otherwise(lit("Physical")).alias("payment_category"),
-            when(col("payment_method").like("%CASH%"), lit(False)).otherwise(lit(True)).alias("is_digital"),
-            lit(0).alias("processing_fee_rate"),
-            current_timestamp().alias("created_at")
-        )
-        dim_pm_rows = [tuple(r) for r in dim_pm_df.collect()]
-        pm_cols = ["payment_method", "payment_channel", "payment_category", "is_digital", "processing_fee_rate", "created_at"]
-        conn = pg_connect(reporting_cfg)
-        upsert_dataframe_to_table(conn, dim_pm_rows, "dim_payment_method", pm_cols, "(payment_method)", [c for c in pm_cols if c != "payment_method"])
-        conn.close()
-        dim_customer_map = spark.read.format("jdbc").option("url", reporting_cfg['jdbc_url']).option("dbtable","reporting.dim_customer").option("user", reporting_cfg['user']).option("password", reporting_cfg['password']).option("driver", reporting_cfg['jdbc_driver']).load().select("customer_key","customer_id")
-        dim_product_map = spark.read.format("jdbc").option("url", reporting_cfg['jdbc_url']).option("dbtable","reporting.dim_product").option("user", reporting_cfg['user']).option("password", reporting_cfg['password']).option("driver", reporting_cfg['jdbc_driver']).load().select("product_key","product_id")
-        dim_loan_map = spark.read.format("jdbc").option("url", reporting_cfg['jdbc_url']).option("dbtable","reporting.dim_loan").option("user", reporting_cfg['user']).option("password", reporting_cfg['password']).option("driver", reporting_cfg['jdbc_driver']).load().select("loan_key","loan_id")
-        dim_payment_method_map = spark.read.format("jdbc").option("url", reporting_cfg['jdbc_url']).option("dbtable","reporting.dim_payment_method").option("user", reporting_cfg['user']).option("password", reporting_cfg['password']).option("driver", reporting_cfg['jdbc_driver']).load().select("payment_method_key","payment_method")
-        fact_applications_df = applications_df.alias("a").join(dim_customer_map.alias("dc"), col("a.customer_id") == col("dc.customer_id"), "left").join(dim_product_map.alias("dp"), col("a.product_id") == col("dp.product_id"), "left").select(
+    )
+    return df
+
+
+def build_dim_payment_method(raw_payments: DataFrame) -> DataFrame:
+    pm = raw_payments.select("payment_method").distinct().na.fill("UNKNOWN")
+    df = pm.select(
+        col("payment_method"),
+        when(col("payment_method").like("%MOBILE%"), lit("Mobile")).when(col("payment_method").like("%BANK%"), lit("Bank")).otherwise(lit("Other")).alias("payment_channel"),
+        when(col("payment_method").like("%MOBILE%"), lit("Digital")).when(col("payment_method").like("%BANK%"), lit("Digital")).otherwise(lit("Physical")).alias("payment_category"),
+        when(col("payment_method").like("%CASH%"), lit(False)).otherwise(lit(True)).alias("is_digital"),
+        lit(0).alias("processing_fee_rate"),
+        current_timestamp().alias("created_at"),
+    )
+    return df
+
+
+def build_fact_loan_applications(raw_apps: DataFrame, raw_loans: DataFrame, dim_customer_map: DataFrame, dim_product_map: DataFrame) -> DataFrame:
+    apps = (
+        raw_apps.alias("a")
+        .join(dim_customer_map.alias("dc"), col("a.customer_id") == col("dc.customer_id"), "left")
+        .join(dim_product_map.alias("dp"), col("a.product_id") == col("dp.product_id"), "left")
+        .select(
             date_format(col("a.submitted_at"), "yyyyMMdd").cast(IntegerType()).alias("application_date_key"),
             col("dc.customer_key").alias("customer_key"),
             col("dp.product_key").alias("product_key"),
@@ -227,20 +306,37 @@ def run_etl_pipeline(run_date=None):
             when(col("a.application_status") == "REJECTED", lit(True)).otherwise(lit(False)).alias("is_rejected"),
             lit(False).alias("is_disbursed"),
             lit(False).alias("is_repeat_customer"),
-            lit(None).cast(IntegerType()).alias("processing_time_hours"),
-            lit(None).cast(IntegerType()).alias("approval_date_key"),
-            lit(None).cast(IntegerType()).alias("disbursement_date_key"),
-            current_timestamp().alias("created_at")
+            lit(None).cast("integer").alias("processing_time_hours"),
+            lit(None).cast("integer").alias("approval_date_key"),
+            lit(None).cast("integer").alias("disbursement_date_key"),
+            current_timestamp().alias("created_at"),
         )
-        la = loans_df.select("application_id", "loan_id", "disbursement_date").filter(col("application_id").isNotNull())
-        fact_applications_df = fact_applications_df.alias("fa").join(la.alias("la"), col("fa.application_id") == col("la.application_id"), "left").withColumn("is_disbursed", when(col("la.loan_id").isNotNull(), True).otherwise(col("is_disbursed"))).withColumn("disbursement_date_key", when(col("la.disbursement_date").isNotNull(), date_format(col("la.disbursement_date"), "yyyyMMdd").cast(IntegerType())).otherwise(lit(None).cast(IntegerType()))).drop("la.application_id")
-        loans_per_customer = loans_df.groupBy("customer_id").count().withColumnRenamed("count","loan_count")
-        apps_with_customer = applications_df.select("application_id","customer_id","submitted_at").alias("a")
-        apps_with_counts = apps_with_customer.join(loans_per_customer.alias("lpc"), "customer_id", "left")
-        repeat_map = apps_with_counts.select("application_id", (col("lpc.loan_count") > 0).alias("is_repeat"))
-        fact_applications_df = fact_applications_df.alias("fa").join(repeat_map.alias("rm"), col("fa.application_id")==col("rm.application_id"), "left").withColumn("is_repeat_customer", coalesce(col("rm.is_repeat"), lit(False))).drop("rm.application_id")
-        payments_with_loan = payments_df.alias("p").join(loans_df.select("loan_id","product_id").alias("l"), col("p.loan_id") == col("l.loan_id"), "left")
-        fact_payments_df = payments_with_loan.join(dim_customer_map.alias("dc"), col("p.customer_id") == col("dc.customer_id"), "left").join(dim_product_map.alias("dp"), col("l.product_id") == col("dp.product_id"), "left").join(dim_payment_method_map.alias("pm"), col("p.payment_method") == col("pm.payment_method"), "left").join(dim_loan_map.alias("dl"), col("p.loan_id") == col("dl.loan_id"), "left").select(
+    )
+
+    loans_map = raw_loans.select("application_id", "loan_id", "disbursement_date").filter(col("application_id").isNotNull())
+    apps = apps.alias("fa").join(loans_map.alias("la"), col("fa.application_id") == col("la.application_id"), "left") \
+        .withColumn("is_disbursed", when(col("la.loan_id").isNotNull(), True).otherwise(col("is_disbursed"))) \
+        .withColumn("disbursement_date_key", when(col("la.disbursement_date").isNotNull(), date_format(col("la.disbursement_date"), "yyyyMMdd").cast(IntegerType())).otherwise(lit(None).cast(IntegerType()))) \
+        .drop("la.application_id")
+
+    # mark repeat customer: a simple heuristic — customer has previous loans
+    loans_per_customer = raw_loans.groupBy("customer_id").count().withColumnRenamed("count", "loan_count")
+    apps = apps.alias("fa").join(loans_per_customer.alias("lpc"), col("fa.customer_key") == col("lpc.customer_id"), "left") \
+        .withColumn("is_repeat_customer", when(col("lpc.loan_count").isNotNull() & (col("lpc.loan_count") > 0), True).otherwise(False)) \
+        .drop("lpc.loan_count")
+
+    return apps
+
+
+def build_fact_payments(raw_payments: DataFrame, raw_loans: DataFrame, dim_customer_map: DataFrame, dim_product_map: DataFrame, dim_payment_method_map: DataFrame, dim_loan_map: DataFrame) -> DataFrame:
+    pay_with_loan = raw_payments.alias("p").join(raw_loans.select("loan_id", "product_id").alias("l"), col("p.loan_id") == col("l.loan_id"), "left")
+    df = (
+        pay_with_loan
+        .join(dim_customer_map.alias("dc"), col("p.customer_id") == col("dc.customer_id"), "left")
+        .join(dim_product_map.alias("dp"), col("l.product_id") == col("dp.product_id"), "left")
+        .join(dim_payment_method_map.alias("pm"), col("p.payment_method") == col("pm.payment_method"), "left")
+        .join(dim_loan_map.alias("dl"), col("p.loan_id") == col("dl.loan_id"), "left")
+        .select(
             date_format(col("p.payment_date"), "yyyyMMdd").cast(IntegerType()).alias("payment_date_key"),
             col("dc.customer_key").alias("customer_key"),
             col("dp.product_key").alias("product_key"),
@@ -257,13 +353,19 @@ def run_etl_pipeline(run_date=None):
             lit(None).cast("boolean").alias("is_late_payment"),
             lit(None).cast(IntegerType()).alias("days_late"),
             col("p.payment_date").alias("original_payment_date"),
-            current_timestamp().alias("created_at")
+            current_timestamp().alias("created_at"),
         )
-        emi_next = emi_df.alias("e").select("loan_id","emi_number","due_date")
-        pp = fact_payments_df.alias("fp").join(emi_next.alias("e"), col("fp.loan_key")==col("e.loan_id"), "left").withColumn("is_on_time", lit(None))
-        snapshot_date_key = int(run_date.replace('-', ''))
-        payments_agg = payments_df.groupBy("loan_id").sum("amount").withColumnRenamed("sum(amount)", "total_paid_amount")
-        portfolio_df = loans_df.alias("l").join(dim_customer_map.alias("dc"), col("l.customer_id") == col("dc.customer_id"), "left").join(dim_product_map.alias("dp"), col("l.product_id") == col("dp.product_id"), "left").join(payments_agg.alias("pa"), col("l.loan_id") == col("pa.loan_id"), "left").select(
+    )
+    return df
+
+
+def build_fact_loan_portfolio(raw_loans: DataFrame, payments_agg: DataFrame, dim_customer_map: DataFrame, dim_product_map: DataFrame, dim_loan_map: DataFrame, snapshot_date_key: int) -> DataFrame:
+    df = (
+        raw_loans.alias("l")
+        .join(dim_customer_map.alias("dc"), col("l.customer_id") == col("dc.customer_id"), "left")
+        .join(dim_product_map.alias("dp"), col("l.product_id") == col("dp.product_id"), "left")
+        .join(payments_agg.alias("pa"), col("l.loan_id") == col("pa.loan_id"), "left")
+        .select(
             lit(snapshot_date_key).alias("date_key"),
             col("dc.customer_key").alias("customer_key"),
             col("dp.product_key").alias("product_key"),
@@ -283,15 +385,25 @@ def run_etl_pipeline(run_date=None):
             (col("l.days_past_due") >= 30).alias("ever_30_dpd"),
             (col("l.days_past_due") >= 60).alias("ever_60_dpd"),
             (col("l.days_past_due") >= 90).alias("ever_90_dpd"),
-            current_timestamp().alias("created_at")
+            current_timestamp().alias("created_at"),
         )
-        portfolio_df = portfolio_df.join(dim_loan_map.alias("dl"), col("loan_id") == col("dl.loan_id"), "left").select("date_key", "customer_key", "product_key", col("dl.loan_key").alias("loan_key"), "principal_amount", "interest_amount", "total_loan_amount", "total_outstanding", "total_paid_amount", "principal_paid", "interest_paid", "days_past_due", "dpd_bucket", "is_current", "is_overdue", "is_defaulted", "ever_30_dpd", "ever_60_dpd", "ever_90_dpd", "created_at")
-        portfolio_rows = [tuple(r) for r in portfolio_df.collect()]
-        portfolio_cols = ["date_key","customer_key","product_key","loan_key","principal_amount","interest_amount","total_loan_amount","total_outstanding","total_paid_amount","principal_paid","interest_paid","days_past_due","dpd_bucket","is_current","is_overdue","is_defaulted","ever_30_dpd","ever_60_dpd","ever_90_dpd","created_at"]
-        conn = pg_connect(reporting_cfg)
-        upsert_dataframe_to_table(conn, portfolio_rows, "fact_loan_portfolio", portfolio_cols, "(date_key, loan_key)", [c for c in portfolio_cols if c not in ("date_key","loan_key")])
-        conn.close()
-        collections_with_loan = collections_df.alias("co").join(loans_df.alias("l"), col("co.loan_id") == col("l.loan_id"), "left").join(dim_customer_map.alias("dc"), col("co.customer_id") == col("dc.customer_id"), "left").select(
+    )
+
+    df = df.join(dim_loan_map.alias("dl"), col("loan_id") == col("dl.loan_id"), "left").select(
+        "date_key", "customer_key", "product_key", col("dl.loan_key").alias("loan_key"),
+        "principal_amount", "interest_amount", "total_loan_amount", "total_outstanding", "total_paid_amount",
+        "principal_paid", "interest_paid", "days_past_due", "dpd_bucket", "is_current", "is_overdue",
+        "is_defaulted", "ever_30_dpd", "ever_60_dpd", "ever_90_dpd", "created_at"
+    )
+    return df
+
+
+def build_fact_collections(raw_collections: DataFrame, raw_loans: DataFrame, dim_customer_map: DataFrame, dim_loan_map: DataFrame) -> DataFrame:
+    df = (
+        raw_collections.alias("co")
+        .join(raw_loans.alias("l"), col("co.loan_id") == col("l.loan_id"), "left")
+        .join(dim_customer_map.alias("dc"), col("co.customer_id") == col("dc.customer_id"), "left")
+        .select(
             col("co.collection_id"),
             date_format(col("co.assignment_date"), "yyyyMMdd").cast(IntegerType()).alias("assignment_date_key"),
             col("dc.customer_key").alias("customer_key"),
@@ -307,30 +419,137 @@ def run_etl_pipeline(run_date=None):
             lit(0.0).alias("recovery_rate"),
             when(col("co.case_status") == "RESOLVED", True).otherwise(False).alias("is_resolved"),
             lit(False).alias("is_successful_recovery"),
-            current_timestamp().alias("created_at")
+            current_timestamp().alias("created_at"),
         )
-        collections_with_loan = collections_with_loan.join(dim_loan_map.alias("dl"), col("loan_id") == col("dl.loan_id"), "left").select("collection_id","assignment_date_key","customer_key","dl.loan_key","assigned_agent","case_status","priority_level","outstanding_at_assignment","days_past_due_at_assignment","case_duration_days","resolution_date_key","amount_recovered","recovery_rate","is_resolved","is_successful_recovery","created_at")
-        coll_rows = [tuple(r) for r in collections_with_loan.collect()]
-        coll_cols = ["collection_id","assignment_date_key","customer_key","loan_key","assigned_agent","case_status","priority_level","outstanding_at_assignment","days_past_due_at_assignment","case_duration_days","resolution_date_key","amount_recovered","recovery_rate","is_resolved","is_successful_recovery","created_at"]
-        conn = pg_connect(reporting_cfg)
-        upsert_dataframe_to_table(conn, coll_rows, "fact_collections", coll_cols, "(collection_id)", [c for c in coll_cols if c != "collection_id"])
-        conn.close()
-        spark.stop()
-        logger.info("RAW->REPORTING idempotent ETL completed successfully")
-        return True
-    except Exception as e:
-        logger.error("ETL failed: %s", str(e))
-        logger.error(traceback.format_exc())
-        try:
-            spark.stop()
-        except:
-            pass
-        return False
-if __name__ == "__main__":
-    run_date = sys.argv[1] if len(sys.argv) > 1 else None
-    success = run_etl_pipeline(run_date)
-    if success:
-        sys.exit(0)
-    else:
-        sys.exit(1)
+    )
+    df = df.join(dim_loan_map.alias("dl"), col("loan_id") == col("dl.loan_id"), "left").select(
+        "collection_id", "assignment_date_key", "customer_key", col("dl.loan_key").alias("loan_key"),
+        "assigned_agent", "case_status", "priority_level", "outstanding_at_assignment", "days_past_due_at_assignment",
+        "case_duration_days", "resolution_date_key", "amount_recovered", "recovery_rate", "is_resolved", "is_successful_recovery", "created_at"
+    )
+    return df
 
+
+def dataframe_to_staging_and_upsert(
+    df: DataFrame,
+    staging_table: str,
+    target_table: str,
+    key_cols: List[str],
+    update_cols: List[str],
+    reporting_cfg: dict
+):
+    # write staging (overwrite)
+    write_df_to_reporting_jdbc(df, reporting_cfg["reporting_jdbc"], reporting_cfg["reporting_user"], reporting_cfg["reporting_password"], reporting_cfg["reporting_driver"], f"reporting.{staging_table}", mode="overwrite")
+
+    # then upsert from staging -> target using psycopg2
+    conn = pg_connect(reporting_cfg)
+    try:
+        upsert_from_staging(conn, staging_table, target_table, key_cols, update_cols)
+    finally:
+        conn.close()
+
+
+def run(run_date: str):
+    cfg = get_config()
+    spark = build_spark_session(f"fairmoney_raw_to_reporting_{run_date}")
+    raw = load_raw_tables(spark, cfg)
+
+    # build basic dims
+    dim_date = build_dim_date(spark, run_date)
+    write_df_to_reporting_jdbc(dim_date, cfg["reporting_jdbc"], cfg["reporting_user"], cfg["reporting_password"], cfg["reporting_driver"], "reporting.dim_date", mode="overwrite")
+
+    dim_customer = build_dim_customer(raw["customers"], raw["countries"], raw["customer_kyc"], run_date)
+    dataframe_to_staging_and_upsert(
+        dim_customer,
+        staging_table="stg_dim_customer",
+        target_table="dim_customer",
+        key_cols=["customer_id"],
+        update_cols=["country_code", "country_name", "currency_code", "customer_name", "phone_number", "email", "date_of_birth", "age_group", "customer_status", "customer_segment", "registration_year", "registration_month", "registration_cohort", "kyc_status", "kyc_verified_date", "effective_date", "end_date", "is_current", "created_at", "updated_at"],
+        reporting_cfg=cfg
+    )
+
+    dim_product = build_dim_product(raw["loan_products"], raw["countries"], run_date)
+    dataframe_to_staging_and_upsert(
+        dim_product,
+        staging_table="stg_dim_product",
+        target_table="dim_product",
+        key_cols=["product_id"],
+        update_cols=["country_code","country_name","product_name","product_code","product_category","min_amount","max_amount","amount_tier","min_tenure_days","max_tenure_days","tenure_tier","interest_rate","interest_tier","processing_fee_rate","risk_tier","is_active","effective_date","updated_at","created_at"],
+        reporting_cfg=cfg
+    )
+
+    dim_loan = build_dim_loan(raw["loans"])
+    dataframe_to_staging_and_upsert(
+        dim_loan,
+        staging_table="stg_dim_loan",
+        target_table="dim_loan",
+        key_cols=["loan_id"],
+        update_cols=["loan_number","loan_status","loan_type","vintage_year","vintage_month","vintage_cohort","maturity_year","maturity_month","tenure_days","tenure_months","tenure_tier","is_first_loan","customer_loan_sequence","created_at","principal_amount","interest_amount","total_amount"],
+        reporting_cfg=cfg
+    )
+
+    dim_payment_method = build_dim_payment_method(raw["payments"])
+    dataframe_to_staging_and_upsert(
+        dim_payment_method,
+        staging_table="stg_dim_payment_method",
+        target_table="dim_payment_method",
+        key_cols=["payment_method"],
+        update_cols=["payment_channel","payment_category","is_digital","processing_fee_rate","created_at"],
+        reporting_cfg=cfg
+    )
+
+    # Load dimension maps from reporting (for fact builds)
+    jdbc_opts = {"url": cfg["reporting_jdbc"], "user": cfg["reporting_user"], "password": cfg["reporting_password"], "driver": cfg["reporting_driver"]}
+    dim_customer_map = spark.read.format("jdbc").option("url", jdbc_opts["url"]).option("dbtable", "reporting.dim_customer").option("user", jdbc_opts["user"]).option("password", jdbc_opts["password"]).option("driver", jdbc_opts["driver"]).load().select("customer_key", "customer_id")
+    dim_product_map = spark.read.format("jdbc").option("url", jdbc_opts["url"]).option("dbtable", "reporting.dim_product").option("user", jdbc_opts["user"]).option("password", jdbc_opts["password"]).option("driver", jdbc_opts["driver"]).load().select("product_key", "product_id")
+    dim_loan_map = spark.read.format("jdbc").option("url", jdbc_opts["url"]).option("dbtable", "reporting.dim_loan").option("user", jdbc_opts["user"]).option("password", jdbc_opts["password"]).option("driver", jdbc_opts["driver"]).load().select("loan_key", "loan_id")
+    dim_payment_method_map = spark.read.format("jdbc").option("url", jdbc_opts["url"]).option("dbtable", "reporting.dim_payment_method").option("user", jdbc_opts["user"]).option("password", jdbc_opts["password"]).option("driver", jdbc_opts["driver"]).load().select("payment_method_key", "payment_method")
+
+    fact_applications = build_fact_loan_applications(raw["loan_applications"], raw["loans"], dim_customer_map, dim_product_map)
+    dataframe_to_staging_and_upsert(
+        fact_applications,
+        staging_table="stg_fact_loan_applications",
+        target_table="fact_loan_applications",
+        key_cols=["application_id"],
+        update_cols=["application_date_key","customer_key","product_key","application_number","requested_amount","requested_tenure_days","application_status","risk_score","is_approved","is_rejected","is_disbursed","is_repeat_customer","processing_time_hours","approval_date_key","disbursement_date_key","created_at"],
+        reporting_cfg=cfg
+    )
+
+    fact_payments = build_fact_payments(raw["payments"], raw["loans"], dim_customer_map, dim_product_map, dim_payment_method_map, dim_loan_map)
+    dataframe_to_staging_and_upsert(
+        fact_payments,
+        staging_table="stg_fact_payments",
+        target_table="fact_payments",
+        key_cols=["payment_id"],
+        update_cols=["payment_date_key","customer_key","product_key","loan_key","payment_method_key","payment_reference","payment_amount","payment_type","payment_status","is_successful","is_on_time","is_early_payment","is_late_payment","days_late","original_payment_date","created_at"],
+        reporting_cfg=cfg
+    )
+
+    payments_agg = raw["payments"].groupBy("loan_id").sum("amount").withColumnRenamed("sum(amount)", "total_paid_amount")
+    fact_portfolio = build_fact_loan_portfolio(raw["loans"], payments_agg, dim_customer_map, dim_product_map, dim_loan_map, int(run_date.replace("-", "")))
+    dataframe_to_staging_and_upsert(
+        fact_portfolio,
+        staging_table="stg_fact_loan_portfolio",
+        target_table="fact_loan_portfolio",
+        key_cols=["date_key", "loan_key"],
+        update_cols=["customer_key","product_key","principal_amount","interest_amount","total_loan_amount","total_outstanding","total_paid_amount","principal_paid","interest_paid","days_past_due","dpd_bucket","is_current","is_overdue","is_defaulted","ever_30_dpd","ever_60_dpd","ever_90_dpd","created_at"],
+        reporting_cfg=cfg
+    )
+
+    fact_collections = build_fact_collections(raw["collections"], raw["loans"], dim_customer_map, dim_loan_map)
+    dataframe_to_staging_and_upsert(
+        fact_collections,
+        staging_table="stg_fact_collections",
+        target_table="fact_collections",
+        key_cols=["collection_id"],
+        update_cols=["assignment_date_key","customer_key","loan_key","assigned_agent","case_status","priority_level","outstanding_at_assignment","days_past_due_at_assignment","case_duration_days","resolution_date_key","amount_recovered","recovery_rate","is_resolved","is_successful_recovery","created_at"],
+        reporting_cfg=cfg
+    )
+
+    spark.stop()
+    LOG.info("ETL run completed successfully")
+
+
+if __name__ == "__main__":
+    run_date_arg = sys.argv[1] if len(sys.argv) > 1 else (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    run(run_date_arg)
