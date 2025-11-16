@@ -2,7 +2,7 @@
 """FairMoney: RAW -> REPORTING ETL (refactored, modular, human-style)
 
 Run:
-    python etl_raw_to_reporting.py 2025-11-15
+    spark-submit etl_raw_to_reporting.py 2025-11-15
 
 Notes:
 - Requires pyspark and psycopg2 in the runtime environment.
